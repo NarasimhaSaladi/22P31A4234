@@ -32,7 +32,7 @@ A fast, reliable, and feature-rich URL shortener API built with **FastAPI** and 
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/NarasimhaSaladi/url-shortener-service
+git clone https://github.com/NarasimhaSaladi/22P31A4234
 cd affordmed
 ```
 
@@ -141,7 +141,7 @@ GET /health
 curl -X POST "http://localhost:8000/shorturls" \
   -H "Content-Type: application/json" \
   -d '{
-    "url": "https://github.com/your-username/your-repo",
+    "url": "https://github.com/NarasimhaSaladi/22P31A4234",
     "validity": 60,
     "shortcode": "github"
   }'
