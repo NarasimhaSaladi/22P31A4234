@@ -1,6 +1,7 @@
 # main.py
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import RedirectResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl, validator
 from datetime import datetime, timedelta
 import string
@@ -10,41 +11,22 @@ from typing import Optional, Dict, Any, List
 import re
 import json
 # Import logging middleware
-from middleware.logging_middleware import LoggingMiddleware
+from middleware.logging_middleware import LoggingMiddleware, global_logger
 
 # FastAPI App
-app = FastAPI()
+app = FastAPI(title="URL Shortener API", version="1.0.0")
 
-# Add logging middleware correctly
+# Add CORS middleware to handle cross-origin requests
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, specify exact origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Add logging middleware
 app.add_middleware(LoggingMiddleware)
-
-# Create a separate logger instance for manual logging
-class SimpleLogger:
-    def __init__(self):
-        self.log_events = []
-    
-    def log_event(self, event_type, data):
-        """Log custom events"""
-        log_entry = {
-            "timestamp": datetime.now().isoformat(),
-            "event_type": event_type,
-            "data": data
-        }
-        print(f"[EVENT] {json.dumps(log_entry)}")
-        self.log_events.append(log_entry)
-    
-    def log_error(self, error_type, message):
-        """Log errors"""
-        log_entry = {
-            "timestamp": datetime.now().isoformat(),
-            "error_type": error_type,
-            "message": message
-        }
-        print(f"[ERROR] {json.dumps(log_entry)}")
-        self.log_events.append(log_entry)
-
-# Create logger instance for manual logging
-logger = SimpleLogger()
 
 # In-memory storage
 url_storage: Dict[str, Dict[str, Any]] = {}
@@ -108,18 +90,40 @@ def get_geographical_info(ip: str) -> str:
         return "Localhost"
     return "Unknown Location"
 
+def ensure_url_scheme(url: str) -> str:
+    """Ensure URL has a proper scheme (http/https)"""
+    if not url.startswith(('http://', 'https://')):
+        return f'https://{url}'
+    return url
+
 # API Endpoints
+@app.get("/")
+async def root():
+    """Root endpoint with API information"""
+    return {
+        "message": "URL Shortener API",
+        "version": "1.0.0",
+        "endpoints": {
+            "create_url": "POST /shorturls",
+            "redirect": "GET /{shortcode}",
+            "stats": "GET /shorturls/{shortcode}",
+            "health": "GET /health"
+        }
+    }
+
 @app.post("/shorturls", status_code=201, response_model=URLCreateResponse)
 async def create_short_url(request: URLCreateRequest):
     """Create a new shortened URL"""
     
     try:
         url_str = str(request.url)
+        # Ensure proper URL scheme
+        url_str = ensure_url_scheme(url_str)
         
         # Handle custom shortcode
         if request.shortcode:
             if request.shortcode in used_shortcodes:
-                logger.log_error("SHORTCODE_EXISTS", f"Shortcode already exists: {request.shortcode}")
+                global_logger.log_error("SHORTCODE_EXISTS", f"Shortcode already exists: {request.shortcode}")
                 raise HTTPException(status_code=400, detail="Shortcode already exists")
             shortcode = request.shortcode
             used_shortcodes.add(shortcode)
@@ -147,22 +151,81 @@ async def create_short_url(request: URLCreateRequest):
         }
         
         # Log URL creation
-        logger.log_event("URL_CREATED", {
+        global_logger.log_event("URL_CREATED", {
             "shortcode": shortcode,
             "url": url_str,
             "validity": request.validity
         })
         
         return URLCreateResponse(
-            shortLink=f"http://hostname:port/{shortcode}",
+            shortLink=f"http://localhost:8000/{shortcode}",
             expiry=expiry_time.isoformat()
         )
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.log_error("URL_CREATION_FAILED", str(e))
+        global_logger.log_error("URL_CREATION_FAILED", str(e))
         raise HTTPException(status_code=500, detail="Internal server error")
+
+# Health check endpoint - MOVED BEFORE /{shortcode} route
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "total_urls": len(url_storage)
+    }
+
+@app.get("/shorturls/{shortcode}", response_model=URLStatsResponse)
+async def get_short_url_stats(shortcode: str):
+    """Get statistics for a shortened URL"""
+    
+    try:
+        if shortcode not in stats_storage:
+            global_logger.log_error("STATS_NOT_FOUND", f"Stats not found for: {shortcode}")
+            raise HTTPException(status_code=404, detail="Short URL not found")
+        
+        stats = stats_storage[shortcode]
+        
+        # Check if expired
+        expiry_time = datetime.fromisoformat(stats["expiry"])
+        is_expired = datetime.now() > expiry_time
+        
+        # Convert click data
+        clicks_data = [
+            ClickData(
+                timestamp=click["timestamp"],
+                source=click["source"],
+                user_agent=click["user_agent"],
+                ip=click["ip"],
+                geographical_info=click.get("geographical_info")
+            )
+            for click in stats["clicks_data"]
+        ]
+        
+        # Log stats access
+        global_logger.log_event("STATS_ACCESSED", {
+            "shortcode": shortcode,
+            "total_clicks": stats["total_clicks"]
+        })
+        
+        return URLStatsResponse(
+            shortcode=shortcode,
+            original_url=stats["original_url"],
+            total_clicks=stats["total_clicks"],
+            created_at=stats["created_at"],
+            expiry=stats["expiry"],
+            clicks_data=clicks_data,
+            is_expired=is_expired
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        global_logger.log_error("STATS_FAILED", str(e))
+        raise HTTPException(status_code=500, detail="Unable to retrieve statistics")
 
 @app.get("/{shortcode}")
 async def redirect_short_url(shortcode: str, request: Request):
@@ -171,7 +234,7 @@ async def redirect_short_url(shortcode: str, request: Request):
     try:
         # Check if shortcode exists
         if shortcode not in url_storage:
-            logger.log_error("SHORTCODE_NOT_FOUND", f"Shortcode not found: {shortcode}")
+            global_logger.log_error("SHORTCODE_NOT_FOUND", f"Shortcode not found: {shortcode}")
             raise HTTPException(status_code=404, detail="Short URL not found")
         
         url_data = url_storage[shortcode]
@@ -179,7 +242,7 @@ async def redirect_short_url(shortcode: str, request: Request):
         # Check if expired
         expiry_time = datetime.fromisoformat(url_data["expiry"])
         if datetime.now() > expiry_time:
-            logger.log_error("URL_EXPIRED", f"URL expired: {shortcode}")
+            global_logger.log_error("URL_EXPIRED", f"URL expired: {shortcode}")
             raise HTTPException(status_code=410, detail="Short URL has expired")
         
         # Get client info
@@ -203,7 +266,7 @@ async def redirect_short_url(shortcode: str, request: Request):
         stats_storage[shortcode]["clicks_data"].append(click_data)
         
         # Log redirect
-        logger.log_event("URL_REDIRECT", {
+        global_logger.log_event("URL_REDIRECT", {
             "shortcode": shortcode,
             "destination": url_data['url'],
             "client_ip": client_ip
@@ -214,57 +277,8 @@ async def redirect_short_url(shortcode: str, request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        logger.log_error("REDIRECT_FAILED", str(e))
+        global_logger.log_error("REDIRECT_FAILED", str(e))
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/shorturls/{shortcode}", response_model=URLStatsResponse)
-async def get_short_url_stats(shortcode: str):
-    """Get statistics for a shortened URL"""
-    
-    try:
-        if shortcode not in stats_storage:
-            logger.log_error("STATS_NOT_FOUND", f"Stats not found for: {shortcode}")
-            raise HTTPException(status_code=404, detail="Short URL not found")
-        
-        stats = stats_storage[shortcode]
-        
-        # Check if expired
-        expiry_time = datetime.fromisoformat(stats["expiry"])
-        is_expired = datetime.now() > expiry_time
-        
-        # Convert click data
-        clicks_data = [
-            ClickData(
-                timestamp=click["timestamp"],
-                source=click["source"],
-                user_agent=click["user_agent"],
-                ip=click["ip"],
-                geographical_info=click.get("geographical_info")
-            )
-            for click in stats["clicks_data"]
-        ]
-        
-        # Log stats access
-        logger.log_event("STATS_ACCESSED", {
-            "shortcode": shortcode,
-            "total_clicks": stats["total_clicks"]
-        })
-        
-        return URLStatsResponse(
-            shortcode=shortcode,
-            original_url=stats["original_url"],
-            total_clicks=stats["total_clicks"],
-            created_at=stats["created_at"],
-            expiry=stats["expiry"],
-            clicks_data=clicks_data,
-            is_expired=is_expired
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.log_error("STATS_FAILED", str(e))
-        raise HTTPException(status_code=500, detail="Unable to retrieve statistics")
-
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
